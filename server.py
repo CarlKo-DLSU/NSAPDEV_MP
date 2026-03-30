@@ -71,7 +71,8 @@ def handle_client(conn, addr):
                 re.IGNORECASE,
             )
 
-            severity_search = re.compile(r'\b(fatal|error|warning|info|debug):\b', re.IGNORECASE)
+            # match severity tokens followed by a colon (allow spaces before/after colon)
+            severity_search = re.compile(r'\b(fatal|error|warning|info|debug)\s*:\s*', re.IGNORECASE)
 
             for line in lines:
                 line = line.strip()
@@ -83,7 +84,10 @@ def handle_client(conn, addr):
                     hostname = m.group('hostname')
                     daemon = m.group('daemon').strip()
                     severity = m.group('severity') or ""
+                    # preserve original message text as parsed by regex
                     message = m.group('message').strip()
+                    # if severity was captured as a prefix, do NOT include it in raw_message
+                    raw_message = message
                 else:
                     # fallback: try to split by first three whitespace groups
                     parts = line.split(None, 4)
@@ -100,6 +104,7 @@ def handle_client(conn, addr):
                             daemon = ''
                             message = rest
                         severity = ""
+                        raw_message = message
                     else:
                         # if completely unparseable, put whole line in message
                         timestamp = ""
@@ -108,24 +113,31 @@ def handle_client(conn, addr):
                         severity = ""
                         message = line
 
-                # if severity empty, try to find inside message
+                # if severity empty, try to find inside message (e.g. "... ERROR: ..." inside message)
                 if not severity:
                     s = severity_search.search(message)
                     if s:
                         severity = s.group(1).lower()
+                        # keep original message with severity present
+                        raw_message = message
+                        # remove the matched severity token (e.g. "ERROR:") from the cleaned message
+                        # only remove the first occurrence to avoid accidental removals
+                        message = message[:s.start()] + message[s.end():]
+                        message = message.strip()
 
-                rows.append((timestamp, hostname, daemon, severity.lower() if severity else '', message))
+                rows.append((timestamp, hostname, daemon, severity.lower() if severity else '', message, raw_message))
 
             # also append to JSON object file (syslog.json) with numeric IDs
             json_path = os.path.join(logs_dir, "syslog.json")
             json_entries = []
-            for (timestamp, hostname, daemon, severity, message) in rows:
+            for (timestamp, hostname, daemon, severity, message, raw_message) in rows:
                 entry = {
                     "timestamp": timestamp,
                     "hostname": hostname,
                     "daemon": daemon,
                     "severity": severity.upper() if severity else "",
                     "message": message,
+                    "raw_message": raw_message,
                 }
                 json_entries.append(entry)
 
@@ -271,13 +283,625 @@ def handle_client(conn, addr):
             except Exception:
                 pass
     else:
-        # fallback: echo simple text
-        try:
-            msg = header
-            print(f"[{addr}] {msg}")
-            conn.sendall(f"Msg received: {msg}".encode(FORMAT))
-        except Exception:
-            pass
+        # support QUERY commands: QUERY|SEARCH_DATE|<date_string>\n
+        if header.startswith("QUERY|"):
+            try:
+                _, qtype, param = header.split("|", 2)
+            except Exception as e:
+                try:
+                    conn.sendall(f"ERROR Invalid QUERY header: {e}".encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+
+            qtype = qtype.upper()
+            if qtype == "SEARCH_DATE":
+                date_string = param
+                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                date_index_path = os.path.join(logs_dir, "date_index.json")
+                json_path = os.path.join(logs_dir, "syslog.json")
+
+                if not os.path.exists(date_index_path):
+                    try:
+                        conn.sendall(f"ERROR date index not found".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                try:
+                    with open(date_index_path, 'r', encoding=FORMAT) as df:
+                        date_index = json.load(df)
+                except Exception as e:
+                    try:
+                        conn.sendall(f"ERROR reading date index: {e}".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                ids = date_index.get(date_string, []) if isinstance(date_index, dict) else []
+
+                if not ids:
+                    try:
+                        conn.sendall(f"NOTFOUND No entries for date '{date_string}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                # load syslog to fetch actual entries
+                if not os.path.exists(json_path):
+                    try:
+                        conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                try:
+                    with open(json_path, 'r', encoding=FORMAT) as jf:
+                        out_dict = json.load(jf)
+                except Exception as e:
+                    try:
+                        conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                # build result lines
+                lines = []
+                for idx in ids:
+                    key = str(idx)
+                    entry = out_dict.get(key) if isinstance(out_dict, dict) else None
+                    if not entry:
+                        # skip missing entries
+                        continue
+                    timestamp = entry.get('timestamp', '')
+                    hostname = entry.get('hostname', '')
+                    daemon = entry.get('daemon', '')
+                    raw = entry.get('raw_message', '')
+                    message = entry.get('message', '')
+                    if raw:
+                        lines.append(f"{timestamp} {hostname} {daemon}: {raw}")
+                    else:
+                        severity = entry.get('severity', '')
+                        sev = severity.lower() if severity else ''
+                        if sev:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {sev}: {message}")
+                        else:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {message}")
+
+                if not lines:
+                    try:
+                        conn.sendall(f"NOTFOUND No valid entries found for date '{date_string}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                # assemble response
+                resp_lines = [f"Found {len(lines)} matching entries for date '{date_string}':"]
+                for i, l in enumerate(lines, start=1):
+                    resp_lines.append(f"{i}. {l}")
+
+                resp_text = "\n".join(resp_lines)
+                try:
+                    conn.sendall(resp_text.encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            elif qtype == "SEARCH_HOST":
+                hostname_query = param
+                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                hostname_index_path = os.path.join(logs_dir, "hostname_index.json")
+                json_path = os.path.join(logs_dir, "syslog.json")
+
+                if not os.path.exists(hostname_index_path):
+                    try:
+                        conn.sendall(f"ERROR hostname index not found".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                try:
+                    with open(hostname_index_path, 'r', encoding=FORMAT) as hf:
+                        hostname_index = json.load(hf)
+                except Exception as e:
+                    try:
+                        conn.sendall(f"ERROR reading hostname index: {e}".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                ids = hostname_index.get(hostname_query, []) if isinstance(hostname_index, dict) else []
+
+                if not ids:
+                    try:
+                        conn.sendall(f"NOTFOUND No entries for hostname '{hostname_query}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                if not os.path.exists(json_path):
+                    try:
+                        conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                try:
+                    with open(json_path, 'r', encoding=FORMAT) as jf:
+                        out_dict = json.load(jf)
+                except Exception as e:
+                    try:
+                        conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                lines = []
+                for idx in ids:
+                    key = str(idx)
+                    entry = out_dict.get(key) if isinstance(out_dict, dict) else None
+                    if not entry:
+                        continue
+                    timestamp = entry.get('timestamp', '')
+                    hostname = entry.get('hostname', '')
+                    daemon = entry.get('daemon', '')
+                    raw = entry.get('raw_message', '')
+                    message = entry.get('message', '')
+                    if raw:
+                        lines.append(f"{timestamp} {hostname} {daemon}: {raw}")
+                    else:
+                        severity = entry.get('severity', '')
+                        sev = severity.lower() if severity else ''
+                        if sev:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {sev}: {message}")
+                        else:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {message}")
+
+                if not lines:
+                    try:
+                        conn.sendall(f"NOTFOUND No valid entries found for hostname '{hostname_query}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                resp_lines = [f"Found {len(lines)} matching entries for hostname '{hostname_query}':"]
+                for i, l in enumerate(lines, start=1):
+                    resp_lines.append(f"{i}. {l}")
+
+                resp_text = "\n".join(resp_lines)
+                try:
+                    conn.sendall(resp_text.encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            elif qtype == "SEARCH_DAEMON":
+                daemon_query = param
+                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                daemon_index_path = os.path.join(logs_dir, "daemon_index.json")
+                json_path = os.path.join(logs_dir, "syslog.json")
+
+                # detect bracketed pid form (e.g. sshd[1234])
+                bracketed = True if re.search(r"\[\d+\]$", daemon_query) else False
+
+                ids = []
+                out_dict = None
+
+                if not bracketed:
+                    # use daemon_index.json
+                    if not os.path.exists(daemon_index_path):
+                        try:
+                            conn.sendall(f"ERROR daemon index not found".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    try:
+                        with open(daemon_index_path, 'r', encoding=FORMAT) as df:
+                            daemon_index = json.load(df)
+                    except Exception as e:
+                        try:
+                            conn.sendall(f"ERROR reading daemon index: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    ids = daemon_index.get(daemon_query, []) if isinstance(daemon_index, dict) else []
+
+                    if not ids:
+                        try:
+                            conn.sendall(f"NOTFOUND No entries for daemon '{daemon_query}'".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    # load syslog to fetch actual entries
+                    if not os.path.exists(json_path):
+                        try:
+                            conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    try:
+                        with open(json_path, 'r', encoding=FORMAT) as jf:
+                            out_dict = json.load(jf)
+                    except Exception as e:
+                        try:
+                            conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+                else:
+                    # bracketed form: scan syslog.json entries for exact daemon substring
+                    if not os.path.exists(json_path):
+                        try:
+                            conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    try:
+                        with open(json_path, 'r', encoding=FORMAT) as jf:
+                            out_dict = json.load(jf)
+                    except Exception as e:
+                        try:
+                            conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    # collect ids where daemon field contains the bracketed form
+                    for key, val in (out_dict.items() if isinstance(out_dict, dict) else []):
+                        try:
+                            idx = int(key)
+                        except Exception:
+                            continue
+                        daemon_field = val.get('daemon', '') if isinstance(val, dict) else ''
+                        if daemon_query in daemon_field:
+                            ids.append(idx)
+
+                    if not ids:
+                        try:
+                            conn.sendall(f"NOTFOUND No entries for daemon '{daemon_query}'".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                # build result lines from out_dict and ids
+                lines = []
+                for idx in ids:
+                    key = str(idx)
+                    entry = out_dict.get(key) if isinstance(out_dict, dict) else None
+                    if not entry:
+                        continue
+                    timestamp = entry.get('timestamp', '')
+                    hostname = entry.get('hostname', '')
+                    daemon = entry.get('daemon', '')
+                    raw = entry.get('raw_message', '')
+                    message = entry.get('message', '')
+                    if raw:
+                        lines.append(f"{timestamp} {hostname} {daemon}: {raw}")
+                    else:
+                        severity = entry.get('severity', '')
+                        sev = severity.lower() if severity else ''
+                        if sev:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {sev}: {message}")
+                        else:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {message}")
+
+                if not lines:
+                    try:
+                        conn.sendall(f"NOTFOUND No valid entries found for daemon '{daemon_query}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                resp_lines = [f"Found {len(lines)} matching entries for daemon '{daemon_query}':"]
+                for i, l in enumerate(lines, start=1):
+                    resp_lines.append(f"{i}. {l}")
+
+                resp_text = "\n".join(resp_lines)
+                try:
+                    conn.sendall(resp_text.encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            elif qtype == "SEARCH_SEVERITY":
+                sev_query = param.strip().upper()
+                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                severity_index_path = os.path.join(logs_dir, "severity_index.json")
+                json_path = os.path.join(logs_dir, "syslog.json")
+
+                ids = []
+                out_dict = None
+
+                # try severity index first
+                if os.path.exists(severity_index_path):
+                    try:
+                        with open(severity_index_path, 'r', encoding=FORMAT) as sf:
+                            severity_index = json.load(sf)
+                    except Exception as e:
+                        try:
+                            conn.sendall(f"ERROR reading severity index: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    if isinstance(severity_index, dict):
+                        ids = severity_index.get(sev_query, [])
+
+                # fallback: scan syslog.json if no ids found
+                if not ids:
+                    if not os.path.exists(json_path):
+                        try:
+                            conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    try:
+                        with open(json_path, 'r', encoding=FORMAT) as jf:
+                            out_dict = json.load(jf)
+                    except Exception as e:
+                        try:
+                            conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                    for key, val in (out_dict.items() if isinstance(out_dict, dict) else []):
+                        try:
+                            idx = int(key)
+                        except Exception:
+                            continue
+                        sev = (val.get('severity', '') if isinstance(val, dict) else '').upper()
+                        if sev == sev_query:
+                            ids.append(idx)
+
+                if not ids:
+                    try:
+                        conn.sendall(f"NOTFOUND No entries for severity '{sev_query}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                # ensure syslog loaded
+                if out_dict is None:
+                    try:
+                        with open(json_path, 'r', encoding=FORMAT) as jf:
+                            out_dict = json.load(jf)
+                    except Exception as e:
+                        try:
+                            conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                        conn.close()
+                        return
+
+                # build result lines
+                lines = []
+                for idx in ids:
+                    key = str(idx)
+                    entry = out_dict.get(key) if isinstance(out_dict, dict) else None
+                    if not entry:
+                        continue
+                    timestamp = entry.get('timestamp', '')
+                    hostname = entry.get('hostname', '')
+                    daemon = entry.get('daemon', '')
+                    raw = entry.get('raw_message', '')
+                    message = entry.get('message', '')
+                    if raw:
+                        lines.append(f"{timestamp} {hostname} {daemon}: {raw}")
+                    else:
+                        severity = entry.get('severity', '')
+                        sev = severity.lower() if severity else ''
+                        if sev:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {sev}: {message}")
+                        else:
+                            lines.append(f"{timestamp} {hostname} {daemon}: {message}")
+
+                if not lines:
+                    try:
+                        conn.sendall(f"NOTFOUND No valid entries found for severity '{sev_query}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                resp_lines = [f"Found {len(lines)} matching entries for severity '{sev_query}':"]
+                for i, l in enumerate(lines, start=1):
+                    resp_lines.append(f"{i}. {l}")
+
+                resp_text = "\n".join(resp_lines)
+                try:
+                    conn.sendall(resp_text.encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            elif qtype == "SEARCH_KEYWORD":
+                keyword = param
+                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                json_path = os.path.join(logs_dir, "syslog.json")
+
+                if not os.path.exists(json_path):
+                    try:
+                        conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                try:
+                    with open(json_path, 'r', encoding=FORMAT) as jf:
+                        out_dict = json.load(jf)
+                except Exception as e:
+                    try:
+                        conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                lines = []
+                kw = keyword.lower()
+                for key, val in (out_dict.items() if isinstance(out_dict, dict) else []):
+                    entry = val if isinstance(val, dict) else None
+                    if not entry:
+                        continue
+                    raw = entry.get('raw_message', '')
+                    if raw and kw in raw.lower():
+                        timestamp = entry.get('timestamp', '')
+                        hostname = entry.get('hostname', '')
+                        daemon = entry.get('daemon', '')
+                        lines.append(f"{timestamp} {hostname} {daemon}: {raw}")
+
+                if not lines:
+                    try:
+                        conn.sendall(f"NOTFOUND No entries containing keyword '{keyword}'".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                resp_lines = [f"Found {len(lines)} matching entries containing '{keyword}':"]
+                for i, l in enumerate(lines, start=1):
+                    resp_lines.append(f"{i}. {l}")
+
+                resp_text = "\n".join(resp_lines)
+                try:
+                    conn.sendall(resp_text.encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            elif qtype == "COUNT_KEYWORD":
+                keyword = param
+                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                json_path = os.path.join(logs_dir, "syslog.json")
+
+                if not os.path.exists(json_path):
+                    try:
+                        conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                try:
+                    with open(json_path, 'r', encoding=FORMAT) as jf:
+                        out_dict = json.load(jf)
+                except Exception as e:
+                    try:
+                        conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                    except Exception:
+                        pass
+                    conn.close()
+                    return
+
+                kw = keyword.lower()
+                count = 0
+                for key, val in (out_dict.items() if isinstance(out_dict, dict) else []):
+                    entry = val if isinstance(val, dict) else None
+                    if not entry:
+                        continue
+                    raw = entry.get('raw_message', '')
+                    if raw and kw in raw.lower():
+                        count += 1
+
+                try:
+                    conn.sendall(f"They keyword '{keyword}' appears in {count} indexed log entry.".encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            else:
+                try:
+                    conn.sendall(f"ERROR Unknown QUERY type: {qtype}".encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+        elif header.strip().upper() == "PURGE":
+            logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+            # if no logs dir, nothing to do
+            if not os.path.exists(logs_dir):
+                try:
+                    conn.sendall("[Server Response] SUCCESS: 0 indexed log entries have been erased.".encode(FORMAT))
+                except Exception:
+                    pass
+                conn.close()
+                return
+            # count entries in syslog.json before deletion
+            json_path = os.path.join(logs_dir, "syslog.json")
+            entries = 0
+            try:
+                if os.path.exists(json_path):
+                    with open(json_path, 'r', encoding=FORMAT) as jf:
+                        existing = json.load(jf)
+                    if isinstance(existing, dict):
+                        entries = len(existing)
+                    elif isinstance(existing, list):
+                        entries = len(existing)
+            except Exception as e:
+                print(f"[ERROR] Counting syslog entries before purge: {e}")
+
+            # remove all .json files in logs dir
+            try:
+                for fname in os.listdir(logs_dir):
+                    if fname.lower().endswith('.json'):
+                        p = os.path.join(logs_dir, fname)
+                        try:
+                            os.remove(p)
+                        except Exception as e:
+                            print(f"[ERROR] Removing {p}: {e}")
+                try:
+                    conn.sendall(f"[Server Response] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    conn.sendall(f"[Server Response] ERROR: Purge failed: {e}".encode(FORMAT))
+                except Exception:
+                    pass
+            conn.close()
+            return
+        else:
+            # fallback: echo simple text
+            try:
+                msg = header
+                print(f"[{addr}] {msg}")
+                conn.sendall(f"Msg received: {msg}".encode(FORMAT))
+            except Exception:
+                pass
 
     conn.close()
 
