@@ -31,6 +31,12 @@ def send_file(path: str, host: str, port: int):
                     if not chunk:
                         break
                     s.sendall(chunk)
+            try:
+                # signal EOF to the server so it won't block waiting for more data
+                s.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+            print("[System Message] Waiting for server acknowledgment...")
             # wait for server acknowledgment
             ack = s.recv(SIZE).decode(FORMAT)
             print(f"[SERVER] {ack}")
