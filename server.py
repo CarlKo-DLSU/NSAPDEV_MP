@@ -85,6 +85,19 @@ def recv_exact(conn, n):
         remaining -= len(chunk)
     return b"".join(chunks)
 
+def load_syslog_from_jsonl(json_path):
+    """Load all entries from JSON Lines file (syslog.jsonl) into dict keyed by ID."""
+    out_dict = {}
+    with open(json_path, 'r', encoding=FORMAT) as jf:
+        for line in jf:
+            line = line.strip()
+            if line:
+                entry = json.loads(line)
+                entry_id = entry.get('id')
+                if entry_id:
+                    out_dict[str(entry_id)] = entry
+    return out_dict
+
 def handle_client(conn, addr):
     global active_connections
     task_type = "UNKNOWN"
@@ -247,133 +260,124 @@ def handle_client(conn, addr):
                             json_entries.append(entry)
 
                         try:
-                            out_dict = {}
+                            # Use JSON Lines format: each entry is one line (no need to load entire file)
+                            # Determine next_id by counting existing lines
                             next_id = 1
                             if os.path.exists(json_path):
                                 with open(json_path, 'r', encoding=FORMAT) as jf:
-                                    try:
-                                        existing = json.load(jf)
-                                    except Exception:
-                                        existing = None
-                                if isinstance(existing, dict):
-                                    out_dict = existing
-                                    try:
-                                        max_key = max(int(k) for k in out_dict.keys() if str(k).isdigit())
-                                        next_id = max_key + 1
-                                    except Exception:
-                                        next_id = len(out_dict) + 1
-                                elif isinstance(existing, list):
-                                    out_dict = {str(i): e for i, e in enumerate(existing, start=1)}
-                                    next_id = len(out_dict) + 1
-                                else:
-                                    out_dict = {}
+                                    line_count = sum(1 for _ in jf)
+                                    next_id = line_count + 1
 
-                            for e in json_entries:
-                                out_dict[str(next_id)] = e
-                                next_id += 1
+                            # track the starting ID for new entries (for incremental index updates)
+                            starting_id = next_id
+                            new_entries_by_id = {}
+                            
+                            # append new entries to the JSON Lines file
+                            with open(json_path, 'a', encoding=FORMAT) as jf:
+                                for e in json_entries:
+                                    e_with_id = {"id": next_id}
+                                    e_with_id.update(e)
+                                    jf.write(json.dumps(e_with_id) + '\n')
+                                    new_entries_by_id[next_id] = e
+                                    next_id += 1
 
-                            with open(json_path, 'w', encoding=FORMAT) as jf:
-                                json.dump(out_dict, jf, indent=2)
-
-                            # rebuild hostname -> [ids] index from the numeric-keyed syslog
+                            # incrementally update indices with only the new entries
+                            # (instead of rebuilding from scratch which is O(n) on total entries)
+                            
+                            # update hostname index
                             hostname_index_path = os.path.join(logs_dir, "hostname_index.json")
                             try:
                                 hostname_index = {}
-                                for key, val in out_dict.items():
-                                    try:
-                                        idx = int(key)
-                                    except Exception:
-                                        continue
-                                    hostname = val.get('hostname', '') if isinstance(val, dict) else ''
+                                if os.path.exists(hostname_index_path):
+                                    with open(hostname_index_path, 'r', encoding=FORMAT) as hf:
+                                        hostname_index = json.load(hf)
+                                        if not isinstance(hostname_index, dict):
+                                            hostname_index = {}
+                                # add only the new entries
+                                for idx, entry in new_entries_by_id.items():
+                                    hostname = entry.get('hostname', '') if isinstance(entry, dict) else ''
                                     if hostname is None:
                                         hostname = ''
                                     if hostname:
                                         hostname_index.setdefault(hostname, []).append(idx)
-
                                 # sort id lists for readability
                                 for h in hostname_index:
                                     hostname_index[h].sort()
-
                                 with open(hostname_index_path, 'w', encoding=FORMAT) as hf:
                                     json.dump(hostname_index, hf, indent=2)
                             except Exception as e:
                                 print(f"[ERROR] Writing hostname index to {hostname_index_path}: {e}")
-                            # rebuild daemon -> [ids] index from the numeric-keyed syslog
+                            
+                            # update daemon index
                             daemon_index_path = os.path.join(logs_dir, "daemon_index.json")
                             try:
                                 daemon_index = {}
-                                for key, val in out_dict.items():
-                                    try:
-                                        idx = int(key)
-                                    except Exception:
-                                        continue
-                                    daemon = val.get('daemon', '') if isinstance(val, dict) else ''
+                                if os.path.exists(daemon_index_path):
+                                    with open(daemon_index_path, 'r', encoding=FORMAT) as df:
+                                        daemon_index = json.load(df)
+                                # add only the new entries
+                                for idx, entry in new_entries_by_id.items():
+                                    daemon = entry.get('daemon', '') if isinstance(entry, dict) else ''
                                     if daemon is None:
                                         daemon = ''
-                                    # remove bracketed parts like [12345]
                                     daemon_clean = re.sub(r'\[.*?\]', '', daemon).strip()
                                     if daemon_clean:
                                         daemon_index.setdefault(daemon_clean, []).append(idx)
-
                                 # sort id lists for readability
                                 for d in daemon_index:
                                     daemon_index[d].sort()
-
                                 with open(daemon_index_path, 'w', encoding=FORMAT) as df:
                                     json.dump(daemon_index, df, indent=2)
                             except Exception as e:
                                 print(f"[ERROR] Writing daemon index to {daemon_index_path}: {e}")
-                            # rebuild severity -> [ids] index from the numeric-keyed syslog
+                            
+                            # update severity index
                             severity_index_path = os.path.join(logs_dir, "severity_index.json")
                             try:
                                 severity_index = {}
-                                for key, val in out_dict.items():
-                                    try:
-                                        idx = int(key)
-                                    except Exception:
-                                        continue
-                                    severity = val.get('severity', '') if isinstance(val, dict) else ''
+                                if os.path.exists(severity_index_path):
+                                    with open(severity_index_path, 'r', encoding=FORMAT) as sf:
+                                        severity_index = json.load(sf)
+                                # add only the new entries
+                                for idx, entry in new_entries_by_id.items():
+                                    severity = entry.get('severity', '') if isinstance(entry, dict) else ''
                                     if severity is None:
                                         severity = ''
                                     sev_clean = severity.strip().upper()
                                     if sev_clean:
                                         severity_index.setdefault(sev_clean, []).append(idx)
-
                                 # sort id lists for readability
                                 for s in severity_index:
                                     severity_index[s].sort()
-
                                 with open(severity_index_path, 'w', encoding=FORMAT) as sf:
                                     json.dump(severity_index, sf, indent=2)
                             except Exception as e:
                                 print(f"[ERROR] Writing severity index to {severity_index_path}: {e}")
-                            # rebuild date -> [ids] index from the numeric-keyed syslog (date only, no time)
+                            
+                            # update date index
                             date_index_path = os.path.join(logs_dir, "date_index.json")
                             try:
                                 date_index = {}
-                                for key, val in out_dict.items():
-                                    try:
-                                        idx = int(key)
-                                    except Exception:
-                                        continue
-                                    timestamp = val.get('timestamp', '') if isinstance(val, dict) else ''
+                                if os.path.exists(date_index_path):
+                                    with open(date_index_path, 'r', encoding=FORMAT) as datef:
+                                        date_index = json.load(datef)
+                                # add only the new entries
+                                for idx, entry in new_entries_by_id.items():
+                                    timestamp = entry.get('timestamp', '') if isinstance(entry, dict) else ''
                                     if not timestamp:
                                         continue
                                     parts = timestamp.split()
                                     if len(parts) >= 2:
-                                        # keep month and day only, e.g. 'Feb 19'
                                         date_only = f"{parts[0]} {parts[1]}"
                                     else:
                                         date_only = timestamp.strip()
                                     if date_only:
                                         date_index.setdefault(date_only, []).append(idx)
-
                                 # sort id lists for readability
                                 for d in date_index:
                                     date_index[d].sort()
-
-                                with open(date_index_path, 'w', encoding=FORMAT) as df:
-                                    json.dump(date_index, df, indent=2)
+                                with open(date_index_path, 'w', encoding=FORMAT) as datef:
+                                    json.dump(date_index, datef, indent=2)
                             except Exception as e:
                                 print(f"[ERROR] Writing date index to {date_index_path}: {e}")
                         except Exception as e:
@@ -410,17 +414,13 @@ def handle_client(conn, addr):
                             pass
                         
                         return
-                    # count entries in syslog.json before deletion
+                    # count entries in syslog.jsonl before deletion
                     json_path = os.path.join(logs_dir, "syslog.json")
                     entries = 0
                     try:
                         if os.path.exists(json_path):
                             with open(json_path, 'r', encoding=FORMAT) as jf:
-                                existing = json.load(jf)
-                            if isinstance(existing, dict):
-                                entries = len(existing)
-                            elif isinstance(existing, list):
-                                entries = len(existing)
+                                entries = sum(1 for _ in jf)  # Count lines in JSON Lines format
                     except Exception as e:
                         print(f"[ERROR] Counting syslog entries before purge: {e}")
 
@@ -501,20 +501,19 @@ def handle_client(conn, addr):
                             
                             return
 
-                        # load syslog to fetch actual entries
+                        # load syslog to fetch actual entries (JSON Lines format)
                         if not os.path.exists(json_path):
                             try:
-                                conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                             except Exception:
                                 pass
                             
                             return
                         try:
-                            with open(json_path, 'r', encoding=FORMAT) as jf:
-                                out_dict = json.load(jf)
+                            out_dict = load_syslog_from_jsonl(json_path)
                         except Exception as e:
                             try:
-                                conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                             except Exception:
                                 pass
                             
@@ -600,17 +599,16 @@ def handle_client(conn, addr):
 
                         if not os.path.exists(json_path):
                             try:
-                                conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                             except Exception:
                                 pass
                             
                             return
                         try:
-                            with open(json_path, 'r', encoding=FORMAT) as jf:
-                                out_dict = json.load(jf)
+                            out_dict = load_syslog_from_jsonl(json_path)
                         except Exception as e:
                             try:
-                                conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                             except Exception:
                                 pass
                             
@@ -699,41 +697,39 @@ def handle_client(conn, addr):
                                 
                                 return
 
-                            # load syslog to fetch actual entries
+                            # load syslog to fetch actual entries (JSON Lines format)
                             if not os.path.exists(json_path):
                                 try:
-                                    conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                    conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
                                 return
 
                             try:
-                                with open(json_path, 'r', encoding=FORMAT) as jf:
-                                    out_dict = json.load(jf)
+                                out_dict = load_syslog_from_jsonl(json_path)
                             except Exception as e:
                                 try:
-                                    conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                    conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
                                 return
                         else:
-                            # bracketed form: scan syslog.json entries for exact daemon substring
+                            # bracketed form: scan syslog.jsonl entries for exact daemon substring
                             if not os.path.exists(json_path):
                                 try:
-                                    conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                    conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
                                 return
 
                             try:
-                                with open(json_path, 'r', encoding=FORMAT) as jf:
-                                    out_dict = json.load(jf)
+                                out_dict = load_syslog_from_jsonl(json_path)
                             except Exception as e:
                                 try:
-                                    conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                    conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
@@ -823,22 +819,21 @@ def handle_client(conn, addr):
                             if isinstance(severity_index, dict):
                                 ids = severity_index.get(sev_query, [])
 
-                        # fallback: scan syslog.json if no ids found
+                        # fallback: scan syslog.jsonl if no ids found
                         if not ids:
                             if not os.path.exists(json_path):
                                 try:
-                                    conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                    conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
                                 return
 
                             try:
-                                with open(json_path, 'r', encoding=FORMAT) as jf:
-                                    out_dict = json.load(jf)
+                                out_dict = load_syslog_from_jsonl(json_path)
                             except Exception as e:
                                 try:
-                                    conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                    conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
@@ -864,11 +859,10 @@ def handle_client(conn, addr):
                         # ensure syslog loaded
                         if out_dict is None:
                             try:
-                                with open(json_path, 'r', encoding=FORMAT) as jf:
-                                    out_dict = json.load(jf)
+                                out_dict = load_syslog_from_jsonl(json_path)
                             except Exception as e:
                                 try:
-                                    conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                    conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                                 except Exception:
                                     pass
                                 
@@ -922,18 +916,17 @@ def handle_client(conn, addr):
 
                         if not os.path.exists(json_path):
                             try:
-                                conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                             except Exception:
                                 pass
                             
                             return
 
                         try:
-                            with open(json_path, 'r', encoding=FORMAT) as jf:
-                                out_dict = json.load(jf)
+                            out_dict = load_syslog_from_jsonl(json_path)
                         except Exception as e:
                             try:
-                                conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                             except Exception:
                                 pass
                             
@@ -978,18 +971,17 @@ def handle_client(conn, addr):
 
                         if not os.path.exists(json_path):
                             try:
-                                conn.sendall(f"ERROR syslog.json not found".encode(FORMAT))
+                                conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                             except Exception:
                                 pass
                             
                             return
 
                         try:
-                            with open(json_path, 'r', encoding=FORMAT) as jf:
-                                out_dict = json.load(jf)
+                            out_dict = load_syslog_from_jsonl(json_path)
                         except Exception as e:
                             try:
-                                conn.sendall(f"ERROR reading syslog.json: {e}".encode(FORMAT))
+                                conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                             except Exception:
                                 pass
                             
@@ -1028,17 +1020,13 @@ def handle_client(conn, addr):
                             pass
                         
                         return
-                    # count entries in syslog.json before deletion
+                    # count entries in syslog.jsonl before deletion
                     json_path = os.path.join(logs_dir, "syslog.json")
                     entries = 0
                     try:
                         if os.path.exists(json_path):
                             with open(json_path, 'r', encoding=FORMAT) as jf:
-                                existing = json.load(jf)
-                            if isinstance(existing, dict):
-                                entries = len(existing)
-                            elif isinstance(existing, list):
-                                entries = len(existing)
+                                entries = sum(1 for _ in jf)  # Count lines in JSON Lines format
                     except Exception as e:
                         print(f"[ERROR] Counting syslog entries before purge: {e}")
 
