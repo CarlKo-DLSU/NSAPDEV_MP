@@ -4,6 +4,7 @@ import os
 import re
 import json
 import time
+import argparse
 
 #IP = "10.20.101.5"
 #PORT = 8080
@@ -406,6 +407,8 @@ def handle_client(conn, addr):
                 else:
                     # PURGE (writer)
                     logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                    # start timer for purge logging
+                    purge_start = time.time()
                     # if no logs dir, nothing to do
                     if not os.path.exists(logs_dir):
                         try:
@@ -426,17 +429,24 @@ def handle_client(conn, addr):
 
                     # remove all .json files in logs dir
                     try:
+                        removed_files = 0
                         for fname in os.listdir(logs_dir):
                             if fname.lower().endswith('.json'):
                                 p = os.path.join(logs_dir, fname)
                                 try:
                                     os.remove(p)
+                                    removed_files += 1
                                 except Exception as e:
                                     print(f"[ERROR] Removing {p}: {e}")
                         try:
                             conn.sendall(f"[Server Response] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
                         except Exception:
                             pass
+                        try:
+                            purge_elapsed = time.time() - purge_start
+                        except Exception:
+                            purge_elapsed = 0.0
+                        print(f"[TASK] from {addr} erased={entries} files_removed={removed_files} took {purge_elapsed:.2f}s")
                     except Exception as e:
                         try:
                             conn.sendall(f"[Server Response] ERROR: Purge failed: {e}".encode(FORMAT))
@@ -453,6 +463,8 @@ def handle_client(conn, addr):
             with seq_cond:
                 next_to_start += 1
                 seq_cond.notify_all()
+            # start timer for query logging
+            proc_start = time.time()
             try:
                 # support QUERY commands: QUERY|SEARCH_DATE|<date_string>\n
                 if header.startswith("QUERY|"):
@@ -560,6 +572,15 @@ def handle_client(conn, addr):
                             conn.sendall(resp_text.encode(FORMAT))
                         except Exception:
                             pass
+                        try:
+                            elapsed = time.time() - proc_start
+                        except Exception:
+                            elapsed = 0.0
+                        try:
+                            match_count = len(lines)
+                        except Exception:
+                            match_count = 'unknown'
+                        print(f"[TASK] {qtype} from {addr} param='{param}' matches={match_count} took {elapsed:.2f}s")
                         
                         return
                     elif qtype == "SEARCH_HOST":
@@ -652,7 +673,16 @@ def handle_client(conn, addr):
                             conn.sendall(resp_text.encode(FORMAT))
                         except Exception:
                             pass
-                        
+                        try:
+                            elapsed = time.time() - proc_start
+                        except Exception:
+                            elapsed = 0.0
+                        try:
+                            match_count = len(lines)
+                        except Exception:
+                            match_count = 'unknown'
+                        print(f"[TASK] {qtype} from {addr} param='{param}' matches={match_count} took {elapsed:.2f}s")
+
                         return
                     elif qtype == "SEARCH_DAEMON":
                         daemon_query = param
@@ -792,7 +822,16 @@ def handle_client(conn, addr):
                             conn.sendall(resp_text.encode(FORMAT))
                         except Exception:
                             pass
-                        
+                        try:
+                            elapsed = time.time() - proc_start
+                        except Exception:
+                            elapsed = 0.0
+                        try:
+                            match_count = len(lines)
+                        except Exception:
+                            match_count = 'unknown'
+                        print(f"[TASK] {qtype} from {addr} param='{param}' matches={match_count} took {elapsed:.2f}s")
+
                         return
                     elif qtype == "SEARCH_SEVERITY":
                         sev_query = param.strip().upper()
@@ -907,7 +946,16 @@ def handle_client(conn, addr):
                             conn.sendall(resp_text.encode(FORMAT))
                         except Exception:
                             pass
-                        
+                        try:
+                            elapsed = time.time() - proc_start
+                        except Exception:
+                            elapsed = 0.0
+                        try:
+                            match_count = len(lines)
+                        except Exception:
+                            match_count = 'unknown'
+                        print(f"[TASK] {qtype} from {addr} param='{param}' matches={match_count} took {elapsed:.2f}s")
+
                         return
                     elif qtype == "SEARCH_KEYWORD":
                         keyword = param
@@ -962,7 +1010,16 @@ def handle_client(conn, addr):
                             conn.sendall(resp_text.encode(FORMAT))
                         except Exception:
                             pass
-                        
+                        try:
+                            elapsed = time.time() - proc_start
+                        except Exception:
+                            elapsed = 0.0
+                        try:
+                            match_count = len(lines)
+                        except Exception:
+                            match_count = 'unknown'
+                        print(f"[TASK] {qtype} from {addr} param='{param}' matches={match_count} took {elapsed:.2f}s")
+
                         return
                     elif qtype == "COUNT_KEYWORD":
                         keyword = param
@@ -1001,7 +1058,12 @@ def handle_client(conn, addr):
                             conn.sendall(f"They keyword '{keyword}' appears in {count} indexed log entry.".encode(FORMAT))
                         except Exception:
                             pass
-                        
+                        try:
+                            elapsed = time.time() - proc_start
+                        except Exception:
+                            elapsed = 0.0
+                        print(f"[TASK] {qtype} from {addr} param='{param}' matches={count} took {elapsed:.2f}s")
+
                         return
                     else:
                         try:
@@ -1076,6 +1138,15 @@ def handle_client(conn, addr):
             print(f"[ACTIVE CONNECTIONS] {active_connections}")
 
 def main():
+    parser = argparse.ArgumentParser(description="Start the syslog server")
+    parser.add_argument('--host', help='IP or hostname to bind to')
+    parser.add_argument('--port', type=int, help='Port to listen on')
+    args = parser.parse_args()
+
+    IP = args.host
+    PORT = args.port
+    ADDR = (IP, PORT)
+
     print("[STARTING] Server is starting...")
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(ADDR)
