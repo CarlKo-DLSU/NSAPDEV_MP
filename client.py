@@ -52,7 +52,7 @@ def main():
             break
         if not line:
             continue
-        if line.lower() in ("quit", "exit", "disconnect"):
+        if line.lower() in ("EXIT"):
             break
         # support quoted args (e.g. QUERY 1.2.3.4:1234 SEARCH_DATE "Feb 22")
         try:
