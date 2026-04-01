@@ -36,12 +36,12 @@ def send_file(path: str, host: str, port: int):
                 s.shutdown(socket.SHUT_WR)
             except Exception:
                 pass
-            print("[System Message] Waiting for server acknowledgment...")
+            print("[SYSTEM] Waiting for server acknowledgment...")
             # wait for server acknowledgment
             ack = s.recv(SIZE).decode(FORMAT)
             print(f"[SERVER] {ack}")
     except Exception as e:
-        print(f"Connection error: {e}")
+        print(f"[SYSTEM] Connection error: {e}")
 
 def main():
     while True:
@@ -94,16 +94,16 @@ def main():
                     # COUNT_KEYWORD: parameter: single token unless quoted
                     keyword = parts[3]
             if ":" not in addr_part:
-                print("Address must be in the form <IP_or_DNS>:<Port>")
+                print("[SYSTEM] Address must be in the form <IP_or_DNS>:<Port>")
                 continue
             host, port_str = addr_part.rsplit(":", 1)
             try:
                 port = int(port_str)
             except ValueError:
-                print("Invalid port:", port_str)
+                print("[SYSTEM] Invalid port:", port_str)
                 continue
 
-            print(f"[System Message] Sending query...")
+            print(f"[SYSTEM] Sending query...")
             try:
                 with socket.create_connection((host, port)) as s:
                     if qcmd == "SEARCH_DATE":
@@ -131,28 +131,28 @@ def main():
                         lines = resp.splitlines()
                         for i, ln in enumerate(lines):
                             if i == 0:
-                                print(f"[Server Response] {ln}")
+                                print(f"[SERVER] {ln}")
                             else:
                                 print(ln)
                     else:
-                        print("[Server Response] (no response)")
+                        print("[SERVER] (no response)")
             except Exception as e:
-                print(f"Connection error: {e}")
+                print(f"[SYSTEM] Connection error: {e}")
             continue
         # PURGE command: PURGE <IP_or_DNS>:<Port>
         if cmd == "PURGE":
             if len(parts) != 2:
-                print("Usage: PURGE <IP_or_DNS>:<Port>")
+                print("[SYSTEM] Usage: PURGE <IP_or_DNS>:<Port>")
                 continue
             addr_part = parts[1]
             if ":" not in addr_part:
-                print("Address must be in the form <IP_or_DNS>:<Port>")
+                print("[SYSTEM] Address must be in the form <IP_or_DNS>:<Port>")
                 continue
             host, port_str = addr_part.rsplit(":", 1)
             try:
                 port = int(port_str)
             except ValueError:
-                print("Invalid port:", port_str)
+                print("[SYSTEM] Invalid port:", port_str)
                 continue
             try:
                 with socket.create_connection((host, port)) as s:
@@ -169,40 +169,40 @@ def main():
                         lines = resp.splitlines()
                         for i, ln in enumerate(lines):
                             if i == 0:
-                                print(f"[Server Response] {ln}")
+                                print(f"{ln}")
                             else:
                                 print(ln)
                     else:
-                        print("[Server Response] (no response)")
+                        print("[SERVER] (no response)")
             except Exception as e:
-                print(f"Connection error: {e}")
+                print(f"[SYSTEM] Connection error: {e}")
             continue
 
         # otherwise fallthrough to existing INGEST handling
         if cmd != INGEST_CMD:
-            print("Unknown command. Use: INGEST <file_path> <IP:Port>")
+            print("[SYSTEM] Unknown command. Use: INGEST <file_path> <IP:Port>")
             continue
         if len(parts) < 3:
-            print("Usage: INGEST <file_path> <IP_or_DNS>:<Port>")
+            print("[SYSTEM] Usage: INGEST <file_path> <IP_or_DNS>:<Port>")
             continue
         file_path = parts[1]
         addr_part = parts[2]
         if not os.path.isfile(file_path):
-            print("File does not exist:", file_path)
+            print("[SYSTEM] File does not exist:", file_path)
             continue
         if not is_text_file(file_path):
-            print("File is not a readable text file:", file_path)
+            print("[SYSTEM] File is not a readable text file:", file_path)
             continue
         if ":" not in addr_part:
-            print("Address must be in the form <IP_or_DNS>:<Port>")
+            print("[SYSTEM] Address must be in the form <IP_or_DNS>:<Port>")
             continue
         host, port_str = addr_part.rsplit(":", 1)
         try:
             port = int(port_str)
         except ValueError:
-            print("Invalid port:", port_str)
+            print("[SYSTEM] Invalid port:", port_str)
             continue
-        print(f"Ingesting '{file_path}' to {host}:{port}...")
+        print(f"[SYSTEM] Ingesting '{file_path}' to {host}:{port}...")
         send_file(file_path, host, port)
 
 if __name__ == "__main__":

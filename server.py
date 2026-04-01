@@ -412,7 +412,7 @@ def handle_client(conn, addr):
                     # if no logs dir, nothing to do
                     if not os.path.exists(logs_dir):
                         try:
-                            conn.sendall("[Server Response] SUCCESS: 0 indexed log entries have been erased.".encode(FORMAT))
+                            conn.sendall("[SERVER] SUCCESS: 0 indexed log entries have been erased.".encode(FORMAT))
                         except Exception:
                             pass
                         
@@ -439,7 +439,7 @@ def handle_client(conn, addr):
                                 except Exception as e:
                                     print(f"[ERROR] Removing {p}: {e}")
                         try:
-                            conn.sendall(f"[Server Response] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
+                            conn.sendall(f"[SERVER] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
                         except Exception:
                             pass
                         try:
@@ -449,7 +449,7 @@ def handle_client(conn, addr):
                         print(f"[TASK] from {addr} erased={entries} files_removed={removed_files} took {purge_elapsed:.2f}s")
                     except Exception as e:
                         try:
-                            conn.sendall(f"[Server Response] ERROR: Purge failed: {e}".encode(FORMAT))
+                            conn.sendall(f"[SERVER] ERROR: Purge failed: {e}".encode(FORMAT))
                         except Exception:
                             pass
                     
@@ -1077,7 +1077,7 @@ def handle_client(conn, addr):
                     # if no logs dir, nothing to do
                     if not os.path.exists(logs_dir):
                         try:
-                            conn.sendall("[Server Response] SUCCESS: 0 indexed log entries have been erased.".encode(FORMAT))
+                            conn.sendall("[SERVER] SUCCESS: 0 indexed log entries have been erased.".encode(FORMAT))
                         except Exception:
                             pass
                         
@@ -1102,12 +1102,12 @@ def handle_client(conn, addr):
                                 except Exception as e:
                                     print(f"[ERROR] Removing {p}: {e}")
                         try:
-                            conn.sendall(f"[Server Response] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
+                            conn.sendall(f"[SERVER] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
                         except Exception:
                             pass
                     except Exception as e:
                         try:
-                            conn.sendall(f"[Server Response] ERROR: Purge failed: {e}".encode(FORMAT))
+                            conn.sendall(f"[SERVER] ERROR: Purge failed: {e}".encode(FORMAT))
                         except Exception:
                             pass
                     
@@ -1116,7 +1116,7 @@ def handle_client(conn, addr):
                     # fallback: echo simple text
                     try:
                         msg = header
-                        print(f"[{addr}] {msg}")
+                        print(f"[CLIENT] [{addr}] {msg}")
                         conn.sendall(f"Msg received: {msg}".encode(FORMAT))
                     except Exception:
                         pass
