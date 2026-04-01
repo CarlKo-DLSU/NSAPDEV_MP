@@ -12,9 +12,56 @@ PORT = 8080
 ADDR = (IP, PORT)
 SIZE = 1024
 FORMAT = "utf-8"
-data_lock = threading.Lock()
+class RWLock:
+    """A simple reader-writer lock with writer preference.
+
+    Readers can run concurrently. Writers are exclusive and when a writer
+    is waiting, new readers will block to avoid writer starvation.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._read_ready = threading.Condition(self._lock)
+        self._readers = 0
+        self._writers_waiting = 0
+        self._writer = False
+
+    def acquire_read(self):
+        with self._lock:
+            # if a writer is active or waiting, readers wait
+            while self._writer or self._writers_waiting > 0:
+                self._read_ready.wait()
+            self._readers += 1
+
+    def release_read(self):
+        with self._lock:
+            self._readers -= 1
+            if self._readers == 0:
+                self._read_ready.notify_all()
+
+    def acquire_write(self):
+        with self._lock:
+            self._writers_waiting += 1
+            while self._writer or self._readers > 0:
+                self._read_ready.wait()
+            self._writers_waiting -= 1
+            self._writer = True
+
+    def release_write(self):
+        with self._lock:
+            self._writer = False
+            self._read_ready.notify_all()
+
+
+data_lock = RWLock()
 active_connections = 0
 conn_lock = threading.Lock()
+# sequencing to ensure FIFO start order of tasks
+seq_lock = threading.Lock()
+seq_cond = threading.Condition(seq_lock)
+# next sequence number to assign
+next_seq = 1
+# next sequence number allowed to start
+next_to_start = 1
 
 def recv_until_newline(conn):
     data = bytearray()
@@ -78,258 +125,335 @@ def handle_client(conn, addr):
         except Exception as e:
             print(f"[ERROR] Failed to read header from {addr}: {e}")
             return
-        with data_lock:
-            if header.startswith("INGEST|"):
-                try:
-                    _, filename, filesize_str = header.split("|", 2)
-                    filesize = int(filesize_str)
-                except Exception as e:
-                    print(f"[ERROR] Invalid INGEST header from {addr}: {header} ({e})")
-                    
-                    return
+        # Decide lock type: queries are readers; INGEST and PURGE are writers.
+        is_ingest = header.startswith("INGEST|")
+        is_query = header.startswith("QUERY|")
+        is_purge = header.strip().upper() == "PURGE"
 
-                logs_dir = os.path.join(os.path.dirname(__file__), "logs")
-                os.makedirs(logs_dir, exist_ok=True)
-                safe_name = os.path.basename(filename)
-                try:
-                    # mark processing start for debugging timing
-                    proc_start = time.time()
-                    file_bytes = recv_exact(conn, filesize)
-                    text = file_bytes.decode(FORMAT, errors="replace")
-                    lines = text.splitlines()
-                    rows = []
+        # FIFO sequencing
+        global next_seq, next_to_start
+        with seq_cond:
+            my_seq = next_seq
+            next_seq += 1
+            while my_seq != next_to_start:
+                seq_cond.wait()
 
-                    # regex to capture: timestamp, hostname, daemon, optional severity, message
-                    main_re = re.compile(
-                        r'^(?P<timestamp>[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+'
-                        r'(?P<hostname>\S+)\s+'
-                        r'(?P<daemon>[^:]+):\s*'
-                        r'(?:(?P<severity>fatal|error|warning|info|debug)\s*:\s*)?'
-                        r'(?P<message>.*)$',
-                        re.IGNORECASE,
-                    )
+        if is_ingest or is_purge:
+            # writer: block all readers and writers
+            data_lock.acquire_write()
+            # mark as started so next in FIFO may begin
+            with seq_cond:
+                next_to_start += 1
+                seq_cond.notify_all()
+            try:
+                if is_ingest:
+                    try:
+                        _, filename, filesize_str = header.split("|", 2)
+                        filesize = int(filesize_str)
+                    except Exception as e:
+                        print(f"[ERROR] Invalid INGEST header from {addr}: {header} ({e})")
+                        
+                        return
 
-                    # match severity tokens followed by a colon (allow spaces before/after colon)
-                    severity_search = re.compile(r'\b(fatal|error|warning|info|debug)\s*:\s*', re.IGNORECASE)
+                    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                    os.makedirs(logs_dir, exist_ok=True)
+                    safe_name = os.path.basename(filename)
+                    try:
+                        # mark processing start for debugging timing
+                        proc_start = time.time()
+                        file_bytes = recv_exact(conn, filesize)
+                        text = file_bytes.decode(FORMAT, errors="replace")
+                        lines = text.splitlines()
+                        rows = []
 
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        m = main_re.match(line)
-                        if m:
-                            timestamp = m.group('timestamp')
-                            hostname = m.group('hostname')
-                            daemon = m.group('daemon').strip()
-                            severity = m.group('severity') or ""
-                            # preserve original message text as parsed by regex
-                            message = m.group('message').strip()
-                            # if severity was captured as a prefix, do NOT include it in raw_message
-                            raw_message = message
-                        else:
-                            # fallback: try to split by first three whitespace groups
-                            parts = line.split(None, 4)
-                            if len(parts) >= 5:
-                                timestamp = f"{parts[0]} {parts[1]} {parts[2]}"
-                                hostname = parts[3]
-                                rest = parts[4]
-                                # attempt to split daemon and message
-                                if ':' in rest:
-                                    daemon_part, message = rest.split(':', 1)
-                                    daemon = daemon_part.strip()
-                                    message = message.strip()
-                                else:
-                                    daemon = ''
-                                    message = rest
-                                severity = ""
+                        # regex to capture: timestamp, hostname, daemon, optional severity, message
+                        main_re = re.compile(
+                            r'^(?P<timestamp>[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+'
+                            r'(?P<hostname>\S+)\s+'
+                            r'(?P<daemon>[^:]+):\s*'
+                            r'(?:(?P<severity>fatal|error|warning|info|debug)\s*:\s*)?'
+                            r'(?P<message>.*)$',
+                            re.IGNORECASE,
+                        )
+
+                        # match severity tokens followed by a colon (allow spaces before/after colon)
+                        severity_search = re.compile(r'\b(fatal|error|warning|info|debug)\s*:\s*', re.IGNORECASE)
+
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            m = main_re.match(line)
+                            if m:
+                                timestamp = m.group('timestamp')
+                                hostname = m.group('hostname')
+                                daemon = m.group('daemon').strip()
+                                severity = m.group('severity') or ""
+                                # preserve original message text as parsed by regex
+                                message = m.group('message').strip()
+                                # if severity was captured as a prefix, do NOT include it in raw_message
                                 raw_message = message
                             else:
-                                # if completely unparseable, put whole line in message
-                                timestamp = ""
-                                hostname = ""
-                                daemon = ""
-                                severity = ""
-                                message = line
+                                # fallback: try to split by first three whitespace groups
+                                parts = line.split(None, 4)
+                                if len(parts) >= 5:
+                                    timestamp = f"{parts[0]} {parts[1]} {parts[2]}"
+                                    hostname = parts[3]
+                                    rest = parts[4]
+                                    # attempt to split daemon and message
+                                    if ':' in rest:
+                                        daemon_part, message = rest.split(':', 1)
+                                        daemon = daemon_part.strip()
+                                        message = message.strip()
+                                    else:
+                                        daemon = ''
+                                        message = rest
+                                    severity = ""
+                                    raw_message = message
+                                else:
+                                    # if completely unparseable, put whole line in message
+                                    timestamp = ""
+                                    hostname = ""
+                                    daemon = ""
+                                    severity = ""
+                                    message = line
 
-                        # if severity empty, try to find inside message (e.g. "... ERROR: ..." inside message)
-                        if not severity:
-                            s = severity_search.search(message)
-                            if s:
-                                severity = s.group(1).lower()
-                                # keep original message with severity present
-                                raw_message = message
-                                # remove the matched severity token (e.g. "ERROR:") from the cleaned message
-                                # only remove the first occurrence to avoid accidental removals
-                                message = message[:s.start()] + message[s.end():]
-                                message = message.strip()
+                            # if severity empty, try to find inside message (e.g. "... ERROR: ..." inside message)
+                            if not severity:
+                                s = severity_search.search(message)
+                                if s:
+                                    severity = s.group(1).lower()
+                                    # keep original message with severity present
+                                    raw_message = message
+                                    # remove the matched severity token (e.g. "ERROR:") from the cleaned message
+                                    # only remove the first occurrence to avoid accidental removals
+                                    message = message[:s.start()] + message[s.end():]
+                                    message = message.strip()
 
-                        rows.append((timestamp, hostname, daemon, severity.lower() if severity else '', message, raw_message))
+                            rows.append((timestamp, hostname, daemon, severity.lower() if severity else '', message, raw_message))
 
-                    # also append to JSON object file (syslog.json) with numeric IDs
+                        # also append to JSON object file (syslog.json) with numeric IDs
+                        json_path = os.path.join(logs_dir, "syslog.json")
+                        json_entries = []
+                        for (timestamp, hostname, daemon, severity, message, raw_message) in rows:
+                            entry = {
+                                "timestamp": timestamp,
+                                "hostname": hostname,
+                                "daemon": daemon,
+                                "severity": severity.upper() if severity else "",
+                                "message": message,
+                                "raw_message": raw_message,
+                            }
+                            json_entries.append(entry)
+
+                        try:
+                            out_dict = {}
+                            next_id = 1
+                            if os.path.exists(json_path):
+                                with open(json_path, 'r', encoding=FORMAT) as jf:
+                                    try:
+                                        existing = json.load(jf)
+                                    except Exception:
+                                        existing = None
+                                if isinstance(existing, dict):
+                                    out_dict = existing
+                                    try:
+                                        max_key = max(int(k) for k in out_dict.keys() if str(k).isdigit())
+                                        next_id = max_key + 1
+                                    except Exception:
+                                        next_id = len(out_dict) + 1
+                                elif isinstance(existing, list):
+                                    out_dict = {str(i): e for i, e in enumerate(existing, start=1)}
+                                    next_id = len(out_dict) + 1
+                                else:
+                                    out_dict = {}
+
+                            for e in json_entries:
+                                out_dict[str(next_id)] = e
+                                next_id += 1
+
+                            with open(json_path, 'w', encoding=FORMAT) as jf:
+                                json.dump(out_dict, jf, indent=2)
+
+                            # rebuild hostname -> [ids] index from the numeric-keyed syslog
+                            hostname_index_path = os.path.join(logs_dir, "hostname_index.json")
+                            try:
+                                hostname_index = {}
+                                for key, val in out_dict.items():
+                                    try:
+                                        idx = int(key)
+                                    except Exception:
+                                        continue
+                                    hostname = val.get('hostname', '') if isinstance(val, dict) else ''
+                                    if hostname is None:
+                                        hostname = ''
+                                    if hostname:
+                                        hostname_index.setdefault(hostname, []).append(idx)
+
+                                # sort id lists for readability
+                                for h in hostname_index:
+                                    hostname_index[h].sort()
+
+                                with open(hostname_index_path, 'w', encoding=FORMAT) as hf:
+                                    json.dump(hostname_index, hf, indent=2)
+                            except Exception as e:
+                                print(f"[ERROR] Writing hostname index to {hostname_index_path}: {e}")
+                            # rebuild daemon -> [ids] index from the numeric-keyed syslog
+                            daemon_index_path = os.path.join(logs_dir, "daemon_index.json")
+                            try:
+                                daemon_index = {}
+                                for key, val in out_dict.items():
+                                    try:
+                                        idx = int(key)
+                                    except Exception:
+                                        continue
+                                    daemon = val.get('daemon', '') if isinstance(val, dict) else ''
+                                    if daemon is None:
+                                        daemon = ''
+                                    # remove bracketed parts like [12345]
+                                    daemon_clean = re.sub(r'\[.*?\]', '', daemon).strip()
+                                    if daemon_clean:
+                                        daemon_index.setdefault(daemon_clean, []).append(idx)
+
+                                # sort id lists for readability
+                                for d in daemon_index:
+                                    daemon_index[d].sort()
+
+                                with open(daemon_index_path, 'w', encoding=FORMAT) as df:
+                                    json.dump(daemon_index, df, indent=2)
+                            except Exception as e:
+                                print(f"[ERROR] Writing daemon index to {daemon_index_path}: {e}")
+                            # rebuild severity -> [ids] index from the numeric-keyed syslog
+                            severity_index_path = os.path.join(logs_dir, "severity_index.json")
+                            try:
+                                severity_index = {}
+                                for key, val in out_dict.items():
+                                    try:
+                                        idx = int(key)
+                                    except Exception:
+                                        continue
+                                    severity = val.get('severity', '') if isinstance(val, dict) else ''
+                                    if severity is None:
+                                        severity = ''
+                                    sev_clean = severity.strip().upper()
+                                    if sev_clean:
+                                        severity_index.setdefault(sev_clean, []).append(idx)
+
+                                # sort id lists for readability
+                                for s in severity_index:
+                                    severity_index[s].sort()
+
+                                with open(severity_index_path, 'w', encoding=FORMAT) as sf:
+                                    json.dump(severity_index, sf, indent=2)
+                            except Exception as e:
+                                print(f"[ERROR] Writing severity index to {severity_index_path}: {e}")
+                            # rebuild date -> [ids] index from the numeric-keyed syslog (date only, no time)
+                            date_index_path = os.path.join(logs_dir, "date_index.json")
+                            try:
+                                date_index = {}
+                                for key, val in out_dict.items():
+                                    try:
+                                        idx = int(key)
+                                    except Exception:
+                                        continue
+                                    timestamp = val.get('timestamp', '') if isinstance(val, dict) else ''
+                                    if not timestamp:
+                                        continue
+                                    parts = timestamp.split()
+                                    if len(parts) >= 2:
+                                        # keep month and day only, e.g. 'Feb 19'
+                                        date_only = f"{parts[0]} {parts[1]}"
+                                    else:
+                                        date_only = timestamp.strip()
+                                    if date_only:
+                                        date_index.setdefault(date_only, []).append(idx)
+
+                                # sort id lists for readability
+                                for d in date_index:
+                                    date_index[d].sort()
+
+                                with open(date_index_path, 'w', encoding=FORMAT) as df:
+                                    json.dump(date_index, df, indent=2)
+                            except Exception as e:
+                                print(f"[ERROR] Writing date index to {date_index_path}: {e}")
+                        except Exception as e:
+                            print(f"[ERROR] Writing JSON to {json_path}: {e}")
+
+                        elapsed = time.time() - proc_start
+                        print(f"[INGEST] Processed {len(rows)} lines from {safe_name} from {addr} -> {json_path} (took {elapsed:.2f}s)")
+                        try:
+                            conn.sendall(f"OK Processed {len(rows)} lines".encode(FORMAT))
+                            # politely signal EOF to client side after sending ACK
+                            try:
+                                conn.shutdown(socket.SHUT_WR)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f"[ERROR] Sending ACK to {addr}: {e}")
+                    except Exception as e:
+                        print(f"[ERROR] Receiving file from {addr}: {e}")
+                        try:
+                            conn.sendall(f"ERROR {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                    
+                    # writer branch done
+                    pass
+                else:
+                    # PURGE (writer)
+                    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+                    # if no logs dir, nothing to do
+                    if not os.path.exists(logs_dir):
+                        try:
+                            conn.sendall("[Server Response] SUCCESS: 0 indexed log entries have been erased.".encode(FORMAT))
+                        except Exception:
+                            pass
+                        
+                        return
+                    # count entries in syslog.json before deletion
                     json_path = os.path.join(logs_dir, "syslog.json")
-                    json_entries = []
-                    for (timestamp, hostname, daemon, severity, message, raw_message) in rows:
-                        entry = {
-                            "timestamp": timestamp,
-                            "hostname": hostname,
-                            "daemon": daemon,
-                            "severity": severity.upper() if severity else "",
-                            "message": message,
-                            "raw_message": raw_message,
-                        }
-                        json_entries.append(entry)
-
+                    entries = 0
                     try:
-                        out_dict = {}
-                        next_id = 1
                         if os.path.exists(json_path):
                             with open(json_path, 'r', encoding=FORMAT) as jf:
-                                try:
-                                    existing = json.load(jf)
-                                except Exception:
-                                    existing = None
+                                existing = json.load(jf)
                             if isinstance(existing, dict):
-                                out_dict = existing
-                                try:
-                                    max_key = max(int(k) for k in out_dict.keys() if str(k).isdigit())
-                                    next_id = max_key + 1
-                                except Exception:
-                                    next_id = len(out_dict) + 1
+                                entries = len(existing)
                             elif isinstance(existing, list):
-                                out_dict = {str(i): e for i, e in enumerate(existing, start=1)}
-                                next_id = len(out_dict) + 1
-                            else:
-                                out_dict = {}
-
-                        for e in json_entries:
-                            out_dict[str(next_id)] = e
-                            next_id += 1
-
-                        with open(json_path, 'w', encoding=FORMAT) as jf:
-                            json.dump(out_dict, jf, indent=2)
-
-                        # rebuild hostname -> [ids] index from the numeric-keyed syslog
-                        hostname_index_path = os.path.join(logs_dir, "hostname_index.json")
-                        try:
-                            hostname_index = {}
-                            for key, val in out_dict.items():
-                                try:
-                                    idx = int(key)
-                                except Exception:
-                                    continue
-                                hostname = val.get('hostname', '') if isinstance(val, dict) else ''
-                                if hostname is None:
-                                    hostname = ''
-                                if hostname:
-                                    hostname_index.setdefault(hostname, []).append(idx)
-
-                            # sort id lists for readability
-                            for h in hostname_index:
-                                hostname_index[h].sort()
-
-                            with open(hostname_index_path, 'w', encoding=FORMAT) as hf:
-                                json.dump(hostname_index, hf, indent=2)
-                        except Exception as e:
-                            print(f"[ERROR] Writing hostname index to {hostname_index_path}: {e}")
-                        # rebuild daemon -> [ids] index from the numeric-keyed syslog
-                        daemon_index_path = os.path.join(logs_dir, "daemon_index.json")
-                        try:
-                            daemon_index = {}
-                            for key, val in out_dict.items():
-                                try:
-                                    idx = int(key)
-                                except Exception:
-                                    continue
-                                daemon = val.get('daemon', '') if isinstance(val, dict) else ''
-                                if daemon is None:
-                                    daemon = ''
-                                # remove bracketed parts like [12345]
-                                daemon_clean = re.sub(r'\[.*?\]', '', daemon).strip()
-                                if daemon_clean:
-                                    daemon_index.setdefault(daemon_clean, []).append(idx)
-
-                            # sort id lists for readability
-                            for d in daemon_index:
-                                daemon_index[d].sort()
-
-                            with open(daemon_index_path, 'w', encoding=FORMAT) as df:
-                                json.dump(daemon_index, df, indent=2)
-                        except Exception as e:
-                            print(f"[ERROR] Writing daemon index to {daemon_index_path}: {e}")
-                        # rebuild severity -> [ids] index from the numeric-keyed syslog
-                        severity_index_path = os.path.join(logs_dir, "severity_index.json")
-                        try:
-                            severity_index = {}
-                            for key, val in out_dict.items():
-                                try:
-                                    idx = int(key)
-                                except Exception:
-                                    continue
-                                severity = val.get('severity', '') if isinstance(val, dict) else ''
-                                if severity is None:
-                                    severity = ''
-                                sev_clean = severity.strip().upper()
-                                if sev_clean:
-                                    severity_index.setdefault(sev_clean, []).append(idx)
-
-                            # sort id lists for readability
-                            for s in severity_index:
-                                severity_index[s].sort()
-
-                            with open(severity_index_path, 'w', encoding=FORMAT) as sf:
-                                json.dump(severity_index, sf, indent=2)
-                        except Exception as e:
-                            print(f"[ERROR] Writing severity index to {severity_index_path}: {e}")
-                        # rebuild date -> [ids] index from the numeric-keyed syslog (date only, no time)
-                        date_index_path = os.path.join(logs_dir, "date_index.json")
-                        try:
-                            date_index = {}
-                            for key, val in out_dict.items():
-                                try:
-                                    idx = int(key)
-                                except Exception:
-                                    continue
-                                timestamp = val.get('timestamp', '') if isinstance(val, dict) else ''
-                                if not timestamp:
-                                    continue
-                                parts = timestamp.split()
-                                if len(parts) >= 2:
-                                    # keep month and day only, e.g. 'Feb 19'
-                                    date_only = f"{parts[0]} {parts[1]}"
-                                else:
-                                    date_only = timestamp.strip()
-                                if date_only:
-                                    date_index.setdefault(date_only, []).append(idx)
-
-                            # sort id lists for readability
-                            for d in date_index:
-                                date_index[d].sort()
-
-                            with open(date_index_path, 'w', encoding=FORMAT) as df:
-                                json.dump(date_index, df, indent=2)
-                        except Exception as e:
-                            print(f"[ERROR] Writing date index to {date_index_path}: {e}")
+                                entries = len(existing)
                     except Exception as e:
-                        print(f"[ERROR] Writing JSON to {json_path}: {e}")
+                        print(f"[ERROR] Counting syslog entries before purge: {e}")
 
-                    elapsed = time.time() - proc_start
-                    print(f"[INGEST] Processed {len(rows)} lines from {safe_name} from {addr} -> {json_path} (took {elapsed:.2f}s)")
+                    # remove all .json files in logs dir
                     try:
-                        conn.sendall(f"OK Processed {len(rows)} lines".encode(FORMAT))
-                        # politely signal EOF to client side after sending ACK
+                        for fname in os.listdir(logs_dir):
+                            if fname.lower().endswith('.json'):
+                                p = os.path.join(logs_dir, fname)
+                                try:
+                                    os.remove(p)
+                                except Exception as e:
+                                    print(f"[ERROR] Removing {p}: {e}")
                         try:
-                            conn.shutdown(socket.SHUT_WR)
+                            conn.sendall(f"[Server Response] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
                         except Exception:
                             pass
                     except Exception as e:
-                        print(f"[ERROR] Sending ACK to {addr}: {e}")
-                except Exception as e:
-                    print(f"[ERROR] Receiving file from {addr}: {e}")
-                    try:
-                        conn.sendall(f"ERROR {e}".encode(FORMAT))
-                    except Exception:
-                        pass
-            else:
+                        try:
+                            conn.sendall(f"[Server Response] ERROR: Purge failed: {e}".encode(FORMAT))
+                        except Exception:
+                            pass
+                    
+                    return
+            finally:
+                data_lock.release_write()
+        elif is_query:
+            # reader: allow concurrent queries unless a writer is waiting/active
+            data_lock.acquire_read()
+            # mark as started so next in FIFO may begin
+            with seq_cond:
+                next_to_start += 1
+                seq_cond.notify_all()
+            try:
                 # support QUERY commands: QUERY|SEARCH_DATE|<date_string>\n
                 if header.startswith("QUERY|"):
                     try:
@@ -946,6 +1070,12 @@ def handle_client(conn, addr):
                         conn.sendall(f"Msg received: {msg}".encode(FORMAT))
                     except Exception:
                         pass
+            finally:
+                # release reader lock after handling QUERY
+                try:
+                    data_lock.release_read()
+                except Exception:
+                    pass
     finally:
         try:
             conn.close()
