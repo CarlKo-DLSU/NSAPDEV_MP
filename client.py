@@ -41,7 +41,7 @@ def send_file(path: str, host: str, port: int):
             ack = s.recv(SIZE).decode(FORMAT)
             print(f"[SERVER] {ack}")
     except Exception as e:
-        print(f"[SYSTEM] Connection error: {e}")
+        print(f"[SYSTEM] Connection closed while receiving file")
 
 def main():
     while True:
@@ -193,7 +193,7 @@ def main():
         if not os.path.isfile(file_path):
             print("[SYSTEM] File does not exist:", file_path)
             continue
-        if not is_text_file(file_path):
+        if not file_path.lower().endswith('.txt'):
             print("[SYSTEM] File is not a readable text file:", file_path)
             continue
         if ":" not in addr_part:

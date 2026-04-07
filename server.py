@@ -306,7 +306,7 @@ def process_ingest(conn, header, addr):
         except Exception as e:
             print(f"[ERROR] Sending ACK to {addr}: {e}")
     except Exception as e:
-        print(f"[ERROR] Receiving file from {addr}: {e}")
+        print(f"[SERVER] ERROR Receiving file from {addr}: Connection closed while receiving file")
         try:
             conn.sendall(f"{e}".encode(FORMAT))
         except Exception:
@@ -342,7 +342,7 @@ def process_purge(conn, addr):
                     os.remove(p)
                     removed_files += 1
                 except Exception as e:
-                    print(f"[ERROR] Removing {p}: {e}")
+                    print(f"[SYSTEM] ERROR Removing {p}: Permission denied")
         try:
             conn.sendall(f"[SERVER] SUCCESS: {entries} indexed log entries have been erased.".encode(FORMAT))
         except Exception:
@@ -354,7 +354,7 @@ def process_purge(conn, addr):
         print(f"[TASK] from {addr} erased={entries} files_removed={removed_files} took {purge_elapsed:.2f}s")
     except Exception as e:
         try:
-            conn.sendall(f"[SERVER] ERROR: Purge failed: {e}".encode(FORMAT))
+            conn.sendall(f"[SERVER] ERROR Purge failed: Permission denied".encode(FORMAT))
         except Exception:
             pass
 
@@ -368,10 +368,31 @@ def process_query(conn, header, addr):
             conn.sendall(f"ERROR Invalid QUERY header: {e}".encode(FORMAT))
         except Exception:
             pass
+        try:
+            elapsed = 0.0
+        except Exception:
+            elapsed = 0.0
+        try:
+            print(f"[TASK] QUERY from {addr} param='' matches=0 took {elapsed:.2f}s")
+        except Exception:
+            pass
         return
 
     qtype = qtype.upper()
     proc_start = time.time()
+    # ensure logs/syslog.json exists for all query types; if missing, return a clear system error
+    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+    json_path = os.path.join(logs_dir, "syslog.json")
+    if not os.path.exists(json_path):
+        try:
+            conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
+        except Exception:
+            pass
+        try:
+            print(f"[SYSTEM] ERROR reading syslog.jsonl: No such file or directory")
+        except Exception:
+            pass
+        return
     # reuse existing query-handling logic from the original handle_client
     if qtype == "SEARCH_DATE":
         date_string = param
@@ -384,6 +405,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR date index not found".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
         try:
             with open(date_index_path, 'r', encoding=FORMAT) as df:
@@ -393,6 +419,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR reading date index: {e}".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         ids = date_index.get(date_string, []) if isinstance(date_index, dict) else []
@@ -401,6 +432,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No entries for date '{date_string}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         if not os.path.exists(json_path):
@@ -408,6 +444,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
         try:
             out_dict = load_syslog_from_jsonl(json_path)
@@ -416,6 +457,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         lines = []
@@ -444,6 +490,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No valid entries found for date '{date_string}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         resp_lines = [f"Found {len(lines)} matching entries for date '{date_string}':"]
@@ -477,6 +528,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR hostname index not found".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
         try:
             with open(hostname_index_path, 'r', encoding=FORMAT) as hf:
@@ -486,6 +542,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR reading hostname index: {e}".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         ids = hostname_index.get(hostname_query, []) if isinstance(hostname_index, dict) else []
@@ -494,6 +555,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No entries for hostname '{hostname_query}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         if not os.path.exists(json_path):
@@ -501,6 +567,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
         try:
             out_dict = load_syslog_from_jsonl(json_path)
@@ -509,6 +580,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         lines = []
@@ -537,6 +613,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No valid entries found for hostname '{hostname_query}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         resp_lines = [f"Found {len(lines)} matching entries for hostname '{hostname_query}':"]
@@ -578,6 +659,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR daemon index not found".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             try:
@@ -588,6 +674,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR reading daemon index: {e}".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             ids = daemon_index.get(daemon_query, []) if isinstance(daemon_index, dict) else []
@@ -597,6 +688,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"No entries for daemon '{daemon_query}'".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             if not os.path.exists(json_path):
@@ -604,6 +700,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             try:
@@ -613,6 +714,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
         else:
             # bracketed form: scan syslog.json for matching substring
@@ -621,6 +727,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             try:
@@ -630,6 +741,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             for key, val in (out_dict.items() if isinstance(out_dict, dict) else []):
@@ -646,6 +762,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"No entries for daemon '{daemon_query}'".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
         # build result lines from out_dict and ids
@@ -675,6 +796,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No valid entries found for daemon '{daemon_query}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         resp_lines = [f"Found {len(lines)} matching entries for daemon '{daemon_query}':"]
@@ -716,6 +842,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR reading severity index: {e}".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             if isinstance(severity_index, dict):
@@ -728,6 +859,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             try:
@@ -737,6 +873,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
             for key, val in (out_dict.items() if isinstance(out_dict, dict) else []):
@@ -753,6 +894,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No entries for severity '{sev_query}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         # ensure syslog loaded
@@ -764,6 +910,11 @@ def process_query(conn, header, addr):
                     conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
                 except Exception:
                     pass
+                try:
+                    elapsed = time.time() - proc_start
+                except Exception:
+                    elapsed = 0.0
+                print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
                 return
 
         # build result lines
@@ -793,6 +944,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No valid entries found for severity '{sev_query}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         resp_lines = [f"Found {len(lines)} matching entries for severity '{sev_query}':"]
@@ -825,6 +981,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         try:
@@ -834,6 +995,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         lines = []
@@ -854,6 +1020,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"No entries containing keyword '{keyword}'".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         resp_lines = [f"Found {len(lines)} matching entries containing '{keyword}':"]
@@ -887,6 +1058,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR syslog.jsonl not found".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         try:
@@ -896,6 +1072,11 @@ def process_query(conn, header, addr):
                 conn.sendall(f"ERROR reading syslog.jsonl: {e}".encode(FORMAT))
             except Exception:
                 pass
+            try:
+                elapsed = time.time() - proc_start
+            except Exception:
+                elapsed = 0.0
+            print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
             return
 
         kw = keyword.lower()
@@ -922,6 +1103,14 @@ def process_query(conn, header, addr):
 
     try:
         conn.sendall(f"ERROR Unknown QUERY type: {qtype}".encode(FORMAT))
+    except Exception:
+        pass
+    try:
+        elapsed = time.time() - proc_start
+    except Exception:
+        elapsed = 0.0
+    try:
+        print(f"[TASK] {qtype} from {addr} param='{param}' matches=0 took {elapsed:.2f}s")
     except Exception:
         pass
     return
