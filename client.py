@@ -130,11 +130,13 @@ def main():
                     if chunks:
                         resp = b"".join(chunks).decode(FORMAT, errors="replace")
                         lines = resp.splitlines()
-                        for i, ln in enumerate(lines):
-                            if i == 0:
-                                print(f"[SERVER] {ln}")
-                            else:
+                        if lines:
+                            # print actual data lines first, then print summary
+                            for ln in lines[1:]:
                                 print(ln)
+                            print(f"[SERVER] {lines[0]}")
+                        else:
+                            print("[SERVER] (no response)")
                     else:
                         print("[SERVER] (no response)")
             except Exception as e:
