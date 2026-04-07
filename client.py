@@ -52,7 +52,8 @@ def main():
             break
         if not line:
             continue
-        if line.lower() in ("EXIT"):
+        # accept 'exit' (case-insensitive)
+        if line.lower() == "exit":
             break
         # support quoted args (e.g. QUERY 1.2.3.4:1234 SEARCH_DATE "Feb 22")
         try:
@@ -180,7 +181,7 @@ def main():
 
         # otherwise fallthrough to existing INGEST handling
         if cmd != INGEST_CMD:
-            print("[SYSTEM] Unknown command. Use: INGEST <file_path> <IP:Port>")
+            print("[SYSTEM] Unknown command. Use: INGEST, QUERY, PURGE, EXIT")
             continue
         if len(parts) < 3:
             print("[SYSTEM] Usage: INGEST <file_path> <IP_or_DNS>:<Port>")
